@@ -1,4 +1,19 @@
 ############################
+# Generated Parameter Files
+############################
+
+# Ignore generated parameter files (keep templates)
+infrastructure/parameters/*.json
+!infrastructure/parameters/*.json.template
+
+# Deployment state files
+infrastructure/.deploy-state/
+
+# Architecture documentation (local only)
+infrastructure/.excalidraw-guide.md
+infrastructure/.architecture-diagram.md
+
+############################
 # OS X
 ############################
 
