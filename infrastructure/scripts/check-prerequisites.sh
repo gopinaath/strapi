@@ -164,6 +164,8 @@ fi
 # Parameters file (if environment and region specified)
 if [ -n "$ENVIRONMENT" ] && [ -n "$REGION" ]; then
     PARAMS_FILE="$SCRIPT_DIR/../parameters/${REGION}-${ENVIRONMENT}.json"
+    PARAMS_TEMPLATE="${PARAMS_FILE}.template"
+    
     if [ -f "$PARAMS_FILE" ]; then
         print_message $GREEN "✓ Parameters file exists: ${REGION}-${ENVIRONMENT}.json"
         
@@ -174,20 +176,51 @@ if [ -n "$ENVIRONMENT" ] && [ -n "$REGION" ]; then
             print_message $RED "✗ Parameters file has invalid JSON syntax"
             ALL_CHECKS_PASSED=false
         fi
+    elif [ -f "$PARAMS_TEMPLATE" ]; then
+        print_message $YELLOW "⚠ Parameters file not found, but template exists"
+        print_message $YELLOW "  Processing template to create parameters file..."
+        
+        # Process the template
+        if "$SCRIPT_DIR/lib/process-parameters.sh" "$PARAMS_TEMPLATE" "$PARAMS_FILE" >/dev/null 2>&1; then
+            print_message $GREEN "✓ Successfully created parameters file from template"
+            
+            # Validate the generated JSON
+            if jq empty "$PARAMS_FILE" 2>/dev/null; then
+                print_message $GREEN "✓ Generated parameters file has valid JSON syntax"
+            else
+                print_message $RED "✗ Generated parameters file has invalid JSON syntax"
+                ALL_CHECKS_PASSED=false
+            fi
+        else
+            print_message $RED "✗ Failed to process parameter template"
+            print_message $YELLOW "  Try running manually: $SCRIPT_DIR/lib/process-parameters.sh $PARAMS_TEMPLATE $PARAMS_FILE"
+            ALL_CHECKS_PASSED=false
+        fi
     else
-        print_message $RED "✗ Parameters file not found: ${REGION}-${ENVIRONMENT}.json"
-        print_message $YELLOW "  Create it by copying from an example:"
-        print_message $YELLOW "  cp $SCRIPT_DIR/../parameters/us-west-2-production.json $PARAMS_FILE"
+        print_message $RED "✗ Neither parameters file nor template found: ${REGION}-${ENVIRONMENT}.json"
+        print_message $YELLOW "  Expected locations:"
+        print_message $YELLOW "    - $PARAMS_FILE"
+        print_message $YELLOW "    - $PARAMS_TEMPLATE"
         ALL_CHECKS_PASSED=false
     fi
 fi
 
 # Check for .env file
-if [ -f "$SCRIPT_DIR/../.env" ]; then
+ENV_FILE="$SCRIPT_DIR/../.env"
+ENV_EXAMPLE="$SCRIPT_DIR/../.env.example"
+if [ -f "$ENV_FILE" ]; then
     print_message $GREEN "✓ .env file exists"
+elif [ -f "$ENV_EXAMPLE" ]; then
+    print_message $YELLOW "⚠ .env file not found, creating from example..."
+    if cp "$ENV_EXAMPLE" "$ENV_FILE"; then
+        print_message $GREEN "✓ Successfully created .env file from example"
+        print_message $YELLOW "  Note: Review and update values in $ENV_FILE as needed"
+    else
+        print_message $YELLOW "⚠ Could not create .env file (will use defaults)"
+        print_message $YELLOW "  Create manually: cp $ENV_EXAMPLE $ENV_FILE"
+    fi
 else
-    print_message $YELLOW "⚠ .env file not found (will use defaults)"
-    print_message $YELLOW "  Create from example: cp $SCRIPT_DIR/../.env.example $SCRIPT_DIR/../.env"
+    print_message $YELLOW "⚠ Neither .env nor .env.example found (will use defaults)"
 fi
 
 # Check required scripts
