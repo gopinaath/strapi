@@ -1,0 +1,74 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "strapi"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "TemplatesBucketName",
+    "ParameterValue": "strapi-cloudformation-templates-{{ACCOUNT_ID}}"
+  },
+  {
+    "ParameterKey": "TemplatesPrefix",
+    "ParameterValue": "cloudformation"
+  },
+  {
+    "ParameterKey": "DBInstanceClass",
+    "ParameterValue": "db.t3.medium"
+  },
+  {
+    "ParameterKey": "DBAllocatedStorage",
+    "ParameterValue": "100"
+  },
+  {
+    "ParameterKey": "DBMasterUsername",
+    "ParameterValue": "strapiuser"
+  },
+  {
+    "ParameterKey": "DBBackupRetentionPeriod",
+    "ParameterValue": "7"
+  },
+  {
+    "ParameterKey": "EnableDeletionProtection",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "TaskCPU",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "TaskMemory",
+    "ParameterValue": "2048"
+  },
+  {
+    "ParameterKey": "DesiredCount",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "MinCapacity",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "MaxCapacity",
+    "ParameterValue": "10"
+  },
+  {
+    "ParameterKey": "StrapiImageUri",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "DeletionPolicy",
+    "ParameterValue": "Delete"
+  },
+  {
+    "ParameterKey": "CloudFrontWebACLArn",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "CreateECSService",
+    "ParameterValue": "true"
+  }
+]

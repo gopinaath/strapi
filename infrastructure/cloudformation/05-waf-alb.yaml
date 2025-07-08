@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS WAF v2 configuration for Application Load Balancer'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: strapi
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - dev
+      - test
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+  AdminIPs:
+    Type: CommaDelimitedList
+    Default: "0.0.0.0/0"
+    Description: Comma-separated list of IP addresses/CIDR blocks allowed to access admin panel
+
+Conditions:
+  RestrictAdminAccess: !Not [!Equals [!Join ["", !Ref AdminIPs], "0.0.0.0/0"]]
+
+Resources:
+  # WAF for ALB (Regional)
+  ALBWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-alb-waf
+      Scope: REGIONAL
+      Description: WAF rules for Strapi ALB
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # Rule 1: Rate limiting
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+
+        # Rule 2: Known bad inputs
+        - Name: CommonAttackProtectionRule
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonAttackProtectionRule
+
+        # Rule 3: SQL injection protection
+        - Name: SQLiProtectionRule
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: SQLiProtectionRule
+
+        # Rule 4: Core rule set
+        - Name: CoreRuleSetRule
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: GenericRFI_BODY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CoreRuleSetRule
+
+        # Rule 5: IP reputation list
+        - Name: IPReputationRule
+          Priority: 5
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: IPReputationRule
+
+        # Rule 6: Admin protection (conditional based on IP restriction)
+        - !If
+          - RestrictAdminAccess
+          - Name: AdminProtectionRule
+            Priority: 6
+            Statement:
+              AndStatement:
+                Statements:
+                  - ByteMatchStatement:
+                      SearchString: /admin
+                      FieldToMatch:
+                        UriPath: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: LOWERCASE
+                      PositionalConstraint: STARTS_WITH
+                  - NotStatement:
+                      Statement:
+                        IPSetReferenceStatement:
+                          Arn: !GetAtt AdminIPSet.Arn
+            Action:
+              Block: {}
+            VisibilityConfig:
+              SampledRequestsEnabled: true
+              CloudWatchMetricsEnabled: true
+              MetricName: AdminProtectionRule
+          - !Ref AWS::NoValue
+
+        # Rule 7: Large request body limit
+        - Name: LargeBodyLimitRule
+          Priority: 7
+          Statement:
+            SizeConstraintStatement:
+              FieldToMatch:
+                Body:
+                  OversizeHandling: MATCH
+              ComparisonOperator: GT
+              Size: 10485760  # 10MB
+              TextTransformations:
+                - Priority: 0
+                  Type: NONE
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: LargeBodyLimitRule
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-${Environment}-alb-waf
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb-waf
+
+  # IP Set for admin access
+  # IP Set for admin access (only created when restricting access)
+  AdminIPSet:
+    Type: AWS::WAFv2::IPSet
+    Condition: RestrictAdminAccess
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-admin-ips
+      Description: Allowed IPs for admin access
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !Ref AdminIPs
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-admin-ips
+
+  # Association with ALB
+  ALBWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-LoadBalancerArn
+      WebACLArn: !GetAtt ALBWebACL.Arn
+
+  # Logging Configuration for ALB WAF
+  ALBWAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-${ProjectName}-${Environment}-alb
+      RetentionInDays: 30
+
+  ALBWAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: ALBWAFLogGroup
+    Properties:
+      ResourceArn: !GetAtt ALBWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt ALBWAFLogGroup.Arn
+      LoggingFilter:
+        DefaultBehavior: DROP
+        Filters:
+          - Behavior: KEEP
+            Conditions:
+              - ActionCondition:
+                  Action: BLOCK
+            Requirement: MEETS_ANY
+
+  # CloudWatch Alarms
+  ALBWAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-alb-waf-blocked-requests
+      AlarmDescription: High number of blocked requests on ALB WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Rule
+          Value: ALL
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-alb-waf
+        - Name: Region
+          Value: !Ref AWS::Region
+      TreatMissingData: notBreaching
+
+  CloudFrontWAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-cloudfront-waf-blocked-requests
+      AlarmDescription: High number of blocked requests on CloudFront WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Rule
+          Value: ALL
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+        - Name: Region
+          Value: GLOBAL
+      TreatMissingData: notBreaching
+
+Outputs:
+  ALBWebACLArn:
+    Description: ARN of the ALB Web ACL
+    Value: !GetAtt ALBWebACL.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ALBWebACLArn
+
+  AdminIPSetArn:
+    Description: ARN of the Admin IP Set (if created)
+    Value: !If
+      - RestrictAdminAccess
+      - !GetAtt AdminIPSet.Arn
+      - "No IP restriction - admin panel open to all"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-AdminIPSetArn

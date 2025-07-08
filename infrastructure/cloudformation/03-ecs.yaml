@@ -1,0 +1,575 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Fargate setup for Strapi application'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: strapi
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - dev
+      - test
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+  ImageUri:
+    Type: String
+    Description: URI of the Docker image for Strapi
+    Default: ""
+
+  TaskCPU:
+    Type: String
+    Default: '1024'
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+    Description: CPU units for the task
+
+  TaskMemory:
+    Type: String
+    Default: '2048'
+    AllowedValues:
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+      - '8192'
+    Description: Memory for the task in MB
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired number of tasks
+
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of tasks for auto-scaling
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Maximum number of tasks for auto-scaling
+
+  CreateService:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the ECS service (set to false for initial deployment)
+
+Conditions:
+  HasImageUri: !Not [!Equals [!Ref ImageUri, ""]]
+  ShouldCreateService: !Equals [!Ref CreateService, 'true']
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-${Environment}-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-cluster
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-${Environment}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecr
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}-${Environment}
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-AppSecretsArn
+                  - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DBPasswordSecretArn
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-MediaBucketArn
+                  - Fn::Sub:
+                    - ${BucketArn}/*
+                    - BucketArn:
+                        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-MediaBucketArn
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref TaskCPU
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: strapi
+          Image: !If
+            - HasImageUri
+            - !Ref ImageUri
+            - !Sub ${ECRRepository.RepositoryUri}:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: 1337
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: HOST
+              Value: 0.0.0.0
+            - Name: PORT
+              Value: '1337'
+            - Name: URL
+              Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+            - Name: STRAPI_ADMIN_BACKEND_URL
+              Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+            - Name: DATABASE_CLIENT
+              Value: postgres
+            - Name: DATABASE_HOST
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DBClusterEndpoint
+            - Name: DATABASE_PORT
+              Value: '5432'
+            - Name: DATABASE_NAME
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DBName
+            - Name: DATABASE_USERNAME
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DBUsername
+            - Name: DATABASE_SSL
+              Value: 'true'
+            - Name: DATABASE_SSL_REJECT_UNAUTHORIZED
+              Value: 'false'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_BUCKET_NAME
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-MediaBucketName
+            - Name: CDN_URL
+              Value:
+                Fn::ImportValue: !Sub ${ProjectName}-${Environment}-CloudFrontURL
+          Secrets:
+            - Name: DATABASE_PASSWORD
+              ValueFrom: !Sub 
+                - "${SecretArn}:password::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-DBPasswordSecretArn"
+            - Name: APP_KEYS
+              ValueFrom: !Sub 
+                - "${SecretArn}:APP_KEYS::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSecretsArn"
+            - Name: API_TOKEN_SALT
+              ValueFrom: !Sub 
+                - "${SecretArn}:API_TOKEN_SALT::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSecretsArn"
+            - Name: ADMIN_JWT_SECRET
+              ValueFrom: !Sub 
+                - "${SecretArn}:ADMIN_JWT_SECRET::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSecretsArn"
+            - Name: TRANSFER_TOKEN_SALT
+              ValueFrom: !Sub 
+                - "${SecretArn}:TRANSFER_TOKEN_SALT::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSecretsArn"
+            - Name: JWT_SECRET
+              ValueFrom: !Sub 
+                - "${SecretArn}:JWT_SECRET::"
+                - SecretArn: 
+                    Fn::ImportValue: !Sub "${ProjectName}-${Environment}-AppSecretsArn"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --no-verbose --tries=1 --spider http://localhost:1337/_health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-ecs-sg
+      GroupDescription: Security group for ECS service
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1337
+          ToPort: 1337
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-sg
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-alb-sg
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb-sg
+
+  Service:
+    Type: AWS::ECS::Service
+    Condition: ShouldCreateService
+    DependsOn:
+      - ALBListener
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DBClientSecurityGroupId
+          Subnets: !Split
+            - ','
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnetIds
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: strapi
+          ContainerPort: 1337
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-service
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-tg
+      Port: 1337
+      Protocol: HTTP
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VPC-ID
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200-399
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-tg
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Split
+        - ','
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PublicSubnetIds
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # Auto Scaling
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: ShouldCreateService
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${ECSCluster}/${Service.Name}
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+
+  ServiceScalingPolicyCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: ShouldCreateService
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  ServiceScalingPolicyMemory:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: ShouldCreateService
+    Properties:
+      PolicyName: !Sub ${ProjectName}-${Environment}-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 70
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # CloudWatch Alarms
+  ServiceCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateService
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-service-cpu-high
+      AlarmDescription: Service CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  ServiceMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateService
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-service-memory-high
+      AlarmDescription: Service memory utilization is too high
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt Service.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      TreatMissingData: notBreaching
+
+  TargetGroupUnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-unhealthy-hosts
+      AlarmDescription: Target group has unhealthy hosts
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      TreatMissingData: notBreaching
+
+Outputs:
+  ClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ClusterName
+
+  ServiceName:
+    Description: ECS Service name
+    Value: !If
+      - ShouldCreateService
+      - !GetAtt Service.Name
+      - "not-created-yet"
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ServiceName
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ECRRepositoryUri
+
+  LoadBalancerDNS:
+    Description: Load Balancer DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LoadBalancerDNS
+
+  LoadBalancerArn:
+    Description: Load Balancer ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-LoadBalancerArn
+
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-ALBSecurityGroupId
