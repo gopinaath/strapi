@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Master stack for Strapi AWS deployment with nested stacks'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: strapi
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - dev
+      - test
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+  TemplatesBucketName:
+    Type: String
+    Description: S3 bucket name containing the CloudFormation templates
+
+  TemplatesPrefix:
+    Type: String
+    Default: cloudformation
+    Description: S3 prefix for CloudFormation templates
+
+  AdminIPs:
+    Type: CommaDelimitedList
+    Default: "0.0.0.0/0"
+    Description: Comma-separated list of IP addresses/CIDR blocks allowed to access admin panel
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+    Description: Database instance type
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 65536
+    Description: Allocated storage in GB
+
+  DBMasterUsername:
+    Type: String
+    Default: strapiuser
+    Description: Database master username
+    NoEcho: true
+
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable deletion protection for resources
+
+  DeletionPolicy:
+    Type: String
+    Default: Retain
+    AllowedValues:
+      - Delete
+      - Retain
+    Description: CloudFormation deletion policy for database resources
+
+  TaskCPU:
+    Type: String
+    Default: '1024'
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+    Description: CPU units for the ECS task
+
+  TaskMemory:
+    Type: String
+    Default: '2048'
+    AllowedValues:
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+      - '8192'
+    Description: Memory for the ECS task in MB
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Desired number of ECS tasks
+
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of tasks for auto-scaling
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Maximum number of tasks for auto-scaling
+
+  StrapiImageUri:
+    Type: String
+    Description: URI of the Docker image for Strapi (leave empty to use ECR)
+    Default: ""
+  
+  EnableVPCFlowLogs:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable VPC Flow Logs for network traffic monitoring (additional charges apply)
+
+  CloudFrontWebACLArn:
+    Type: String
+    Default: ''
+    Description: ARN of the CloudFront WAF WebACL (from us-east-1 deployment)
+
+  CreateECSService:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the ECS service (set to false for initial deployment)
+
+Resources:
+  # 1. VPC Stack
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/01-vpc.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        EnableVPCFlowLogs: !Ref EnableVPCFlowLogs
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc-stack
+
+  # 2. Secrets Manager Stack
+  SecretsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/06-secrets.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        DatabaseUsername: !Ref DBMasterUsername
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-secrets-stack
+
+  # 3. RDS Stack
+  RDSStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPCStack
+      - SecretsStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/02-rds.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        DBInstanceClass: !Ref DBInstanceClass
+        DBAllocatedStorage: !Ref DBAllocatedStorage
+        DBMasterUsername: !Ref DBMasterUsername
+        DBMasterPasswordSecret: !GetAtt SecretsStack.Outputs.DBPasswordSecretArn
+        DBBackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+        EnableDeletionProtection: !Ref EnableDeletionProtection
+        DeletionPolicy: !Ref DeletionPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-rds-stack
+
+  # 4. S3 and CloudFront Stack
+  S3CloudFrontStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPCStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/04-s3-cloudfront.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        CloudFrontWebACLArn: !Ref CloudFrontWebACLArn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-s3-cloudfront-stack
+
+  # 5. ECS Stack
+  ECSStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPCStack
+      - RDSStack
+      - SecretsStack
+      - S3CloudFrontStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/03-ecs.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        ImageUri: !Ref StrapiImageUri
+        TaskCPU: !Ref TaskCPU
+        TaskMemory: !Ref TaskMemory
+        DesiredCount: !Ref DesiredCount
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        CreateService: !Ref CreateECSService
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-ecs-stack
+
+  # 6. WAF Stack (after ECS for ALB association)
+  WAFStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ECSStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesPrefix}/05-waf-alb.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        AdminIPs: !Join [",", !Ref AdminIPs]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-waf-stack
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !GetAtt VPCStack.Outputs.VPCId
+
+  LoadBalancerURL:
+    Description: Application Load Balancer URL
+    Value: !Sub http://${ECSStack.Outputs.LoadBalancerDNS}
+
+  CloudFrontURL:
+    Description: CloudFront distribution URL for media
+    Value: !GetAtt S3CloudFrontStack.Outputs.CloudFrontURL
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI for Strapi images
+    Value: !GetAtt ECSStack.Outputs.ECRRepositoryUri
+
+  DatabaseEndpoint:
+    Description: RDS Database endpoint
+    Value: !GetAtt RDSStack.Outputs.DBClusterEndpoint
+
+  MediaBucketName:
+    Description: S3 bucket name for media storage
+    Value: !GetAtt S3CloudFrontStack.Outputs.MediaBucketName
+
+  ECSClusterName:
+    Description: ECS Cluster name
+    Value: !GetAtt ECSStack.Outputs.ClusterName
+
+  ECSServiceName:
+    Description: ECS Service name
+    Value: !GetAtt ECSStack.Outputs.ServiceName
+
+  AdminIPSetArn:
+    Description: WAF Admin IP Set ARN (update with actual admin IPs)
+    Value: !GetAtt WAFStack.Outputs.AdminIPSetArn
+
+  DeploymentInstructions:
+    Description: Next steps for deployment
+    Value: |
+      1. Build and push your Strapi Docker image to ECR
+      2. Update the ECS service with the new image
+      3. Configure your domain name to point to the ALB
+      4. Update WAF admin IP set with allowed IPs
+      5. Configure SSL certificate on the ALB
+      6. Update security groups as needed

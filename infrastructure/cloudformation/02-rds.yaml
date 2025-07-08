@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS PostgreSQL Multi-AZ setup for Strapi'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: strapi
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - dev
+      - test
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.t3.xlarge
+      - db.t3.2xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+    Description: Database instance type
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 65536
+    Description: Allocated storage in GB
+
+  DBMasterUsername:
+    Type: String
+    Default: strapiuser
+    Description: Database master username
+    NoEcho: true
+
+  DBMasterPasswordSecret:
+    Type: String
+    Description: ARN of the secret containing database master password
+    NoEcho: true
+
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable deletion protection for the database
+
+  DeletionPolicy:
+    Type: String
+    Default: Retain
+    AllowedValues:
+      - Delete
+      - Retain
+    Description: CloudFormation deletion policy for database resources
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${ProjectName}-${Environment}-db-subnet-group
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds: !Split
+        - ','
+        - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-DatabaseSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-subnet-group
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-db-sg
+      GroupDescription: Security group for RDS PostgreSQL
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DBClientSecurityGroup
+          Description: Allow PostgreSQL access from ECS tasks
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-sg
+
+  DBClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectName}-${Environment}-db-client-sg
+      GroupDescription: Security group for database clients
+      VpcId:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-VPC-ID
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-client-sg
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub ${ProjectName}-${Environment}-db-params
+      Description: PostgreSQL parameter group for Strapi
+      Family: aurora-postgresql15
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+        log_statement: 'all'
+        log_duration: 'on'
+        log_min_duration_statement: 1000
+        max_connections: 200
+        random_page_cost: 1.1
+        effective_cache_size: 2097152
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-params
+
+  DBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: PostgreSQL cluster parameter group for Strapi
+      Family: aurora-postgresql15
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-cluster-params
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: !Ref DeletionPolicy
+    UpdateReplacePolicy: !Ref DeletionPolicy
+    Properties:
+      DBClusterIdentifier: !Sub ${ProjectName}-${Environment}-db-cluster
+      Engine: aurora-postgresql
+      EngineVersion: '15.4'
+      EngineMode: provisioned
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterPasswordSecret}:SecretString:password}}'
+      DatabaseName: strapi
+      Port: 5432
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      PreferredBackupWindow: 03:00-04:00
+      PreferredMaintenanceWindow: sun:04:00-sun:05:00
+      EnableCloudwatchLogsExports:
+        - postgresql
+      StorageEncrypted: true
+      KmsKeyId: alias/aws/rds
+      DeletionProtection: !Ref EnableDeletionProtection
+      EnableHttpEndpoint: false
+      EnableIAMDatabaseAuthentication: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-cluster
+
+  DBInstancePrimary:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !Ref DeletionPolicy
+    UpdateReplacePolicy: !Ref DeletionPolicy
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${Environment}-db-primary
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: aurora-postgresql
+      DBParameterGroupName: !Ref DBParameterGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-primary
+
+  DBInstanceSecondary:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !Ref DeletionPolicy
+    UpdateReplacePolicy: !Ref DeletionPolicy
+    Properties:
+      DBInstanceIdentifier: !Sub ${ProjectName}-${Environment}-db-secondary
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: aurora-postgresql
+      DBParameterGroupName: !Ref DBParameterGroup
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DBMonitoringRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-secondary
+
+  DBMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-rds-monitoring-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # CloudWatch Alarms
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-db-cpu-high
+      AlarmDescription: Database CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref DBCluster
+      TreatMissingData: notBreaching
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-db-connections-high
+      AlarmDescription: Database connection count is too high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 150
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref DBCluster
+      TreatMissingData: notBreaching
+
+  DatabaseFreeStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-db-storage-low
+      AlarmDescription: Database free storage space is low
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10737418240  # 10GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref DBCluster
+      TreatMissingData: notBreaching
+
+Outputs:
+  DBClusterEndpoint:
+    Description: Database cluster endpoint
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBClusterEndpoint
+
+  DBClusterReadEndpoint:
+    Description: Database cluster read endpoint
+    Value: !GetAtt DBCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBClusterReadEndpoint
+
+  DBClusterPort:
+    Description: Database port
+    Value: !GetAtt DBCluster.Endpoint.Port
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBClusterPort
+
+  DBName:
+    Description: Database name
+    Value: strapi
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBName
+
+  DBUsername:
+    Description: Database username
+    Value: !Ref DBMasterUsername
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBUsername
+
+  DBClientSecurityGroupId:
+    Description: Security group ID for database clients
+    Value: !Ref DBClientSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-DBClientSecurityGroupId

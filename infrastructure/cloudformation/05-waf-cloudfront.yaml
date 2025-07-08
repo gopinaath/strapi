@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS WAF v2 configuration for CloudFront (must be deployed in us-east-1)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: strapi
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - dev
+      - test
+      - development
+      - staging
+      - production
+    Description: Environment name
+
+Resources:
+  # WAF for CloudFront (Global)
+  CloudFrontWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+      Scope: CLOUDFRONT
+      Description: WAF rules for Strapi CloudFront distribution
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # Rule 1: Rate limiting
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 5000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontRateLimitRule
+
+        # Rule 2: Block common attacks
+        - Name: CommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: GenericRFI_BODY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontCommonRuleSet
+
+        # Rule 3: Known bad inputs for media
+        - Name: KnownBadInputsRule
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontBadInputsRule
+
+        # Rule 4: IP reputation list
+        - Name: IPReputationRule
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CloudFrontIPReputationRule
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms
+  CloudFrontWAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-cloudfront-waf-blocked-requests
+      AlarmDescription: High number of blocked requests on CloudFront WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Dimensions:
+        - Name: Rule
+          Value: ALL
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+        - Name: Region
+          Value: GLOBAL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  CloudFrontWAFRateLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Environment}-cloudfront-waf-rate-limit
+      AlarmDescription: Rate limit triggered on CloudFront WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Dimensions:
+        - Name: Rule
+          Value: RateLimitRule
+        - Name: WebACL
+          Value: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+        - Name: Region
+          Value: GLOBAL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  CloudFrontWebACLArn:
+    Description: ARN of the CloudFront WAF WebACL
+    Value: !GetAtt CloudFrontWebACL.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CloudFrontWebACLArn
+
+  CloudFrontWebACLId:
+    Description: ID of the CloudFront WAF WebACL
+    Value: !Ref CloudFrontWebACL
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CloudFrontWebACLId
+
+  CloudFrontWebACLName:
+    Description: Name of the CloudFront WAF WebACL
+    Value: !Sub ${ProjectName}-${Environment}-cloudfront-waf
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-CloudFrontWebACLName

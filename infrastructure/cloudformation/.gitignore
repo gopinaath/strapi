@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# AWS credentials
+.aws/
+aws-credentials
+
+# Terraform state files (if used later)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# Log files
+*.log
