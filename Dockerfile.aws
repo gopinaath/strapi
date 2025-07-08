@@ -1,0 +1,64 @@
+# Multi-stage Dockerfile for deploying Strapi monorepo example app to AWS
+
+# Build stage
+FROM node:18-alpine AS builder
+
+# Install build dependencies including vips from main repository
+RUN apk update && apk add --no-cache \
+    build-base \
+    gcc \
+    autoconf \
+    automake \
+    zlib-dev \
+    libpng-dev \
+    nasm \
+    vips-dev \
+    libc6-compat \
+    git \
+    python3 \
+    make \
+    g++
+
+WORKDIR /opt/app
+
+# Copy the entire monorepo
+COPY . .
+
+# Install dependencies for the monorepo
+# Note: Not using --frozen-lockfile due to monorepo lockfile sync issues
+# Set sharp to download prebuilt binaries if available
+ENV SHARP_IGNORE_GLOBAL_LIBVIPS=1
+RUN yarn install --network-timeout 600000
+
+# Build all packages in the monorepo
+RUN yarn build
+
+# Build the getstarted application (including admin panel)
+WORKDIR /opt/app/examples/getstarted
+RUN yarn build
+# Production stage
+FROM node:18-alpine
+
+# Install runtime dependencies
+RUN apk add --no-cache vips-dev
+
+WORKDIR /opt/app
+
+# Copy the entire built monorepo
+COPY --from=builder /opt/app .
+
+# Set working directory to the example app
+WORKDIR /opt/app/examples/getstarted
+
+# Expose port
+EXPOSE 1337
+
+# Set environment to production
+ENV NODE_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:1337/_health', (res) => { process.exit(res.statusCode === 204 ? 0 : 1); });"
+
+# Start Strapi
+CMD ["yarn", "start"]
